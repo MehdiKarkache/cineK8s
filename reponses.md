@@ -220,4 +220,105 @@ On obtient 404, parce qu'aucune règle de l'Ingress ne couvre `/actuator`. C'est
 
 ## Partie 6
 
+### 6.1 Le service movie disparaît
+
+**Prédictions (écrites avant de lancer les commandes)**
+- (a) Les pods ticket passent en `0/1` (readiness DOWN car le check `movie` échoue), mais `RESTARTS` reste à 0 (liveness toujours OK).
+- (b) `kubectl get endpoints ticket` : plus aucune adresse (`<none>`), les pods non prêts sont retirés du Service.
+- (c) `GET http://cinema.local/api/tickets` : 503, renvoyé par l'Ingress parce que le Service ticket n'a plus d'endpoint.
+- (d) La liveness de ticket reste `UP`.
+
+**Observations**
+```
+PS> kubectl scale deploy/movie --replicas=0
+deployment.apps/movie scaled
+
+PS> kubectl get pods
+NAME                      READY   STATUS    RESTARTS   AGE
+ticket-66d95c98b6-7zh2g   0/1     Running   0          17m
+ticket-66d95c98b6-nqfqg   0/1     Running   0          17m
+
+PS> kubectl get endpoints ticket
+NAME     ENDPOINTS   AGE
+ticket               17m
+
+PS> curl.exe -si http://cinema.local/api/tickets | Select-Object -First 1
+HTTP/1.1 503 Service Temporarily Unavailable
+
+PS> kubectl get events --field-selector reason=Unhealthy -o custom-columns=OBJET:.involvedObject.name,MESSAGE:.message
+ticket-66d95c98b6-7zh2g   Readiness probe failed: HTTP probe failed with statuscode: 503
+ticket-66d95c98b6-nqfqg   Readiness probe failed: HTTP probe failed with statuscode: 503
+
+PS> kubectl exec deploy/ticket -- wget -qO- http://localhost:8080/actuator/health/liveness
+{"status":"UP"}
+```
+Retour à la normale, sans rien toucher à ticket :
+```
+PS> kubectl scale deploy/movie --replicas=2
+PS> kubectl get pods
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-59684459f4-5l67c    1/1     Running   0          23s
+movie-59684459f4-vtfxt    1/1     Running   0          23s
+ticket-66d95c98b6-7zh2g   1/1     Running   0          18m
+ticket-66d95c98b6-nqfqg   1/1     Running   0          18m
+
+PS> kubectl get endpoints ticket
+NAME     ENDPOINTS                           AGE
+ticket   10.244.0.14:8080,10.244.0.16:8080   18m
+```
+Les 4 prédictions sont vérifiées. Ticket est redevenu prêt environ 5 s après movie, avec `RESTARTS` toujours à 0, et `/api/tickets` répond de nouveau 200.
+
+**Q6.1**
+1. movie est à 0 réplica, donc le `MovieHealthIndicator` de ticket n'arrive plus à joindre `http://movie:8080` : `/actuator/health/readiness` de ticket passe DOWN (HTTP 503).
+2. La readinessProbe de ticket échoue plusieurs fois de suite (`Readiness probe failed: … statuscode: 503`), donc Kubernetes marque les pods ticket NotReady (0/1).
+3. Les pods NotReady sont retirés des endpoints du Service ticket : `kubectl get endpoints ticket` est vide.
+4. L'Ingress n'a plus aucun backend pour `/api/tickets`, donc il répond lui-même 503 Service Temporarily Unavailable, une erreur propre au lieu d'erreurs applicatives.
+
+`RESTARTS` est resté à 0 parce que la liveness (et la startup) de ticket ne dépend pas de movie : ticket lui-même fonctionne, sa liveness reste UP, donc le kubelet n'a aucune raison de redémarrer le conteneur. La dépendance est seulement dans la readiness (Q1.3).
+
+### 6.2 Mission dépannage (`broken/ticket-debug.yaml`)
+
+| # | Statut observé | Commande de diagnostic | Cause exacte | Correction apportée |
+|---|----------------|------------------------|--------------|---------------------|
+| 1 | `ErrImagePull` puis `ImagePullBackOff` | `kubectl describe pod <pod>` (Events) | `imagePullPolicy: Always` : le kubelet essaie de télécharger `docker.io/library/ticket-service:1.0.0` (« pull access denied, repository does not exist »), alors que l'image n'existe que dans Minikube | `imagePullPolicy: IfNotPresent` |
+| 2 | `CreateContainerConfigError` | `kubectl describe pod <pod>` (Events) + `kubectl get cm` | `configmap "ticket-configmap" not found` : la ConfigMap s'appelle `ticket-config` | `configMapRef.name: ticket-config` |
+| 3 | `Running` mais `0/1` en permanence | `kubectl describe pod <pod>` (Events) + `kubectl logs <pod>` | `Readiness probe failed: … :8081 … connection refused` : la probe vise le port 8081, alors que l'appli écoute sur 8080 (`Tomcat started on port 8080`) | readinessProbe sur `port: http` (le port nommé = 8080) |
+
+Détail des messages relevés :
+```
+1) Failed to pull image "ticket-service:1.0.0": … "docker.io/library/ticket-service:1.0.0": pull access denied, repository does not exist or may require authorization
+2) Error: configmap "ticket-configmap" not found
+3) Readiness probe failed: Get "http://10.244.0.21:8081/actuator/health/readiness": dial tcp 10.244.0.21:8081: connect: connection refused
+```
+Résultat après les 3 corrections (uniquement dans le YAML, pas dans le code Java) :
+```
+PS> kubectl get pods -l app=ticket-debug
+NAME                            READY   STATUS    RESTARTS   AGE
+ticket-debug-77fbf56679-h7ct6   1/1     Running   0          21s
+
+PS> kubectl delete -f broken/ticket-debug.yaml
+deployment.apps "ticket-debug" deleted from cinema-exam namespace
+```
+Les erreurs apparaissent bien l'une après l'autre : l'image doit d'abord être récupérée, puis la config du conteneur (ConfigMap) est construite au démarrage, et la readiness n'est testée qu'une fois le conteneur lancé.
+
+### 6.3 Changer la configuration sans rebuild
+```
+PS> kubectl apply -f k8s/10-config.yaml
+configmap/movie-config configured
+configmap/ticket-config unchanged
+
+PS> curl.exe -s http://cinema.local/api/movies/whoami
+{"hostname":"movie-59684459f4-5l67c","environment":"kubernetes"}
+
+PS> kubectl rollout restart deploy/movie
+PS> kubectl rollout status deploy/movie
+deployment "movie" successfully rolled out
+
+PS> curl.exe -s http://cinema.local/api/movies/whoami
+{"environment":"production","hostname":"movie-67fd5fbdfc-bmrxl"}
+```
+
+**Q6.3**
+La ConfigMap est injectée avec `envFrom`, donc sous forme de variables d'environnement. Elles sont lues une seule fois, au démarrage du conteneur : modifier la ConfigMap ne change rien dans les pods déjà lancés, d'où `"kubernetes"` juste après le `apply`. C'est le `kubectl rollout restart` qui a rendu la modification effective : il recrée les pods (rolling update), et les nouveaux pods lisent la nouvelle valeur `production` au démarrage.
+
 ## Partie 7

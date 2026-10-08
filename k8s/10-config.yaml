@@ -5,7 +5,7 @@ metadata:
   namespace: cinema-exam
 data:
   # relaxed binding : MOVIE_ENVIRONMENT -> movie.environment
-  MOVIE_ENVIRONMENT: kubernetes
+  MOVIE_ENVIRONMENT: production
 ---
 apiVersion: v1
 kind: ConfigMap
