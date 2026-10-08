@@ -417,3 +417,30 @@ PS> kubectl exec deploy/movie -- sh -c 'touch /tmp/ok && echo /tmp inscriptible'
 /tmp inscriptible
 ```
 Le conteneur tourne avec l'uid 10001, la racine est en lecture seule, seul `/tmp` (emptyDir) est inscriptible, et les pods sont `1/1`. L'application répond toujours normalement via `cinema.local`.
+
+### B2 — Rolling update sans coupure
+J'ai ajouté à `movie` (dans `k8s/20-movie.yaml`) :
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+```
+Puis j'ai lancé 300 requêtes (une toutes les 200 ms) pendant un `kubectl rollout restart deploy/movie` :
+```
+PS> $job = Start-Job { 1..300 | ForEach-Object { curl.exe -s -o NUL -w "%{http_code}" http://cinema.local/api/movies; Start-Sleep -Milliseconds 200 } }
+PS> kubectl rollout restart deploy/movie
+PS> kubectl rollout status deploy/movie
+deployment "movie" successfully rolled out
+PS> Receive-Job $job -Wait | Group-Object | Select-Object Count, Name      (équivalent de sort | uniq -c)
+Count Name
+----- ----
+  300 200
+```
+
+**QB2**
+Résultat : 300 réponses `200` sur 300, aucune erreur pendant le remplacement des deux pods movie. Trois éléments y contribuent :
+- **`strategy` (`maxUnavailable: 0`, `maxSurge: 1`)** : Kubernetes crée d'abord un nouveau pod (3 pods au maximum) et ne supprime un ancien que quand le nouveau est disponible. On a donc toujours au moins 2 pods prêts.
+- **`readinessProbe`** : un nouveau pod n'est ajouté aux endpoints du Service qu'une fois `/actuator/health/readiness` UP. Pendant le démarrage de la JVM, il ne reçoit aucune requête.
+- **`server.shutdown: graceful`** : quand un ancien pod reçoit SIGTERM, Spring termine les requêtes en cours avant de s'arrêter, donc aucune requête n'est coupée au milieu.
