@@ -380,3 +380,40 @@ movie-67fd5fbdfc-szdbw   1/1     Running   0          37m
 movie-67fd5fbdfc-zrh44   1/1     Running   0          6s
 ```
 Un nouveau pod (`movie-67fd5fbdfc-zrh44`, avec un nouveau nom et une nouvelle IP) est recréé immédiatement : le ReplicaSet du Deployment voit 1 pod au lieu des 2 demandés et corrige l'écart (boucle de réconciliation). Pendant ce temps, l'autre pod continue de répondre, donc pas de coupure. Avec un `kind: Pod` « nu », personne ne l'aurait recréé : le pod aurait disparu définitivement, et on aurait aussi perdu le scaling (`replicas`), le rolling update et le rollback.
+
+## Bonus
+
+### B1 — Durcir le Deployment movie
+J'ai ajouté au conteneur `movie` (dans `k8s/20-movie.yaml`) un `securityContext` : `runAsNonRoot: true`, `runAsUser: 10001`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` et `readOnlyRootFilesystem: true`.
+
+Premier essai avec seulement le `securityContext` : le nouveau pod plante, mais les anciens pods continuent de servir (rolling update).
+```
+PS> kubectl get pods -l app=movie
+NAME                     READY   STATUS             RESTARTS      AGE
+movie-67fd5fbdfc-szdbw   1/1     Running            0             57m
+movie-67fd5fbdfc-zrh44   1/1     Running            0             20m
+movie-7ff589bbfb-mvdj6   0/1     CrashLoopBackOff   2 (14s ago)   40s
+
+PS> kubectl logs movie-7ff589bbfb-mvdj6
+org.springframework.context.ApplicationContextException: Unable to start web server
+Caused by: org.springframework.boot.web.server.WebServerException: Unable to create tempDir. java.io.tmpdir is set to /tmp
+```
+Tomcat a besoin d ecrire un dossier temporaire dans `/tmp`, ce qui est impossible avec une racine en lecture seule. J'ai donc ajouté un volume `emptyDir` monté sur `/tmp` (`volumes` au niveau du pod, `volumeMounts` au niveau du conteneur).
+
+Vérification :
+```
+PS> kubectl get pods -l app=movie
+NAME                    READY   STATUS    RESTARTS   AGE
+movie-f747689d6-8n5r2   1/1     Running   0          16s
+movie-f747689d6-rxwjr   1/1     Running   0          9s
+
+PS> kubectl exec deploy/movie -- id
+uid=10001(spring) gid=101(spring) groups=101(spring)
+
+PS> kubectl exec deploy/movie -- touch /test
+touch: cannot touch '/test': Read-only file system
+
+PS> kubectl exec deploy/movie -- sh -c 'touch /tmp/ok && echo /tmp inscriptible'
+/tmp inscriptible
+```
+Le conteneur tourne avec l'uid 10001, la racine est en lecture seule, seul `/tmp` (emptyDir) est inscriptible, et les pods sont `1/1`. L'application répond toujours normalement via `cinema.local`.
