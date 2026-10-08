@@ -169,6 +169,55 @@ Avec `imagePullPolicy: Always`, le kubelet essaierait à chaque démarrage de t�
 
 ## Partie 5
 
+### 5.1 Préparation
+L'addon ingress était déjà activé. Sous Windows avec le driver Docker, `minikube ip` n'est pas joignable : j'ai lancé `minikube tunnel` dans un terminal dédié et ajouté `127.0.0.1 cinema.local` dans `C:\Windows\System32\drivers\etc\hosts` (équivalent de `/etc/hosts`).
+```
+PS> kubectl get pods -n ingress-nginx
+NAME                                       READY   STATUS    RESTARTS       AGE
+ingress-nginx-controller-d7cd8c989-j5kk9   1/1     Running   4 (109m ago)   46h
+```
+
+### 5.2 Ingress (`k8s/40-ingress.yaml`)
+```
+PS> kubectl describe ingress cinema
+  Host          Path  Backends
+  cinema.local
+                /api/movies    movie:http (10.244.0.13:8080,10.244.0.15:8080)
+                /api/tickets   ticket:http (10.244.0.14:8080,10.244.0.16:8080)
+```
+
+### 5.3 Tests
+```
+PS> (Invoke-RestMethod http://cinema.local/api/movies).title
+Pod Fiction
+Le Seigneur des Pods
+Docker Wars
+Rollback to the Future
+
+PS> curl.exe -s -X POST http://cinema.local/api/tickets -H "Content-Type: application/json" -d '{"movieId":3,"seats":10}'
+{"id":3,"movieId":3,"movieTitle":"Docker Wars","seats":10,"total":90.00,"createdAt":"2026-10-08T11:03:17.221366646Z"}
+
+PS> 1..6 | ForEach-Object { (Invoke-RestMethod http://cinema.local/api/movies/whoami).hostname }
+movie-59684459f4-2wcdh
+movie-59684459f4-9kgsz
+movie-59684459f4-2wcdh
+movie-59684459f4-9kgsz
+movie-59684459f4-2wcdh
+movie-59684459f4-9kgsz
+
+PS> curl.exe -s -o NUL -w "%{http_code}" http://cinema.local/actuator/health
+404
+```
+
+**Q5.1**
+Deux pods movie différents ont répondu, en alternance (`movie-59684459f4-2wcdh` et `movie-59684459f4-9kgsz`). C'est le Service `movie` qui répartit la charge : il regroupe les pods qui ont le label `app: movie` dans ses endpoints, et l'Ingress Controller nginx envoie les requêtes à tour de rôle vers ces endpoints.
+
+**Q5.2**
+Avec `pathType: Exact`, seule l'URL exacte `/api/movies` correspondrait à la règle. `GET /api/movies/1` (et aussi `/api/movies/whoami`) ne correspondrait à aucune règle, donc l'Ingress répondrait 404. Avec `Prefix`, tout ce qui commence par `/api/movies` est routé vers movie.
+
+**Q5.3**
+On obtient 404, parce qu'aucune règle de l'Ingress ne couvre `/actuator`. C'est souhaitable : les endpoints Actuator (santé avec `show-details: always`, infos internes) ne doivent pas être exposés publiquement. Les probes n'en ont pas besoin, puisque le kubelet appelle directement l'IP du pod, sans passer par l'Ingress. On expose uniquement les routes métier `/api/movies` et `/api/tickets`.
+
 ## Partie 6
 
 ## Partie 7
