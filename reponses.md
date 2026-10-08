@@ -322,3 +322,61 @@ PS> curl.exe -s http://cinema.local/api/movies/whoami
 La ConfigMap est injectée avec `envFrom`, donc sous forme de variables d'environnement. Elles sont lues une seule fois, au démarrage du conteneur : modifier la ConfigMap ne change rien dans les pods déjà lancés, d'où `"kubernetes"` juste après le `apply`. C'est le `kubectl rollout restart` qui a rendu la modification effective : il recrée les pods (rolling update), et les nouveaux pods lisent la nouvelle valeur `production` au démarrage.
 
 ## Partie 7
+
+**Q7.1**
+1. Le pod ticket demande au DNS l'adresse de `movie`. Son `/etc/resolv.conf` pointe vers CoreDNS (le DNS du cluster) et contient le domaine de recherche `cinema-exam.svc.cluster.local`, donc `movie` est complété en `movie.cinema-exam.svc.cluster.local`.
+2. CoreDNS répond avec la ClusterIP du Service `movie` : une IP virtuelle et stable, qui ne correspond à aucun pod.
+3. Ticket envoie la requête HTTP vers ClusterIP:8080. Les règles réseau installées par kube-proxy sur le nœud interceptent ce trafic et le redirigent vers un des endpoints du Service, c'est-à-dire l'IP:8080 d'un pod `app: movie` prêt (choisi au hasard parmi les pods Ready).
+4. Le pod movie choisi reçoit `GET /api/movies/1` sur son port `http` (8080) et répond. Si un pod movie disparaît ou n'est pas prêt, il n'est plus dans les endpoints et ne reçoit plus de requêtes.
+
+Vérification dans un pod ticket :
+```
+PS> kubectl exec deploy/ticket -- cat /etc/resolv.conf
+search cinema-exam.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+
+PS> kubectl exec deploy/ticket -- nslookup movie.cinema-exam.svc.cluster.local
+Name:    movie.cinema-exam.svc.cluster.local
+Address: 10.109.96.41
+
+PS> kubectl get svc movie
+NAME    TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
+movie   ClusterIP   10.109.96.41   <none>        8080/TCP   59m
+```
+`10.96.0.10` est l'IP du Service `kube-dns` (CoreDNS), et le nom `movie` est bien résolu en ClusterIP du Service movie.
+
+**Q7.2**
+```
+PS> 1..4 | ForEach-Object { curl.exe -s -X POST http://cinema.local/api/tickets -H "Content-Type: application/json" -d '{"movieId":3,"seats":1}' }
+{"id":1,"movieId":3,"movieTitle":"Docker Wars","seats":1,"total":9.00,…}
+{"id":4,"movieId":3,"movieTitle":"Docker Wars","seats":1,"total":9.00,…}
+{"id":5,"movieId":3,"movieTitle":"Docker Wars","seats":1,"total":9.00,…}
+{"id":6,"movieId":3,"movieTitle":"Docker Wars","seats":1,"total":9.00,…}
+
+PS> (appel répété de GET http://cinema.local/api/tickets, nombre de tickets renvoyés)
+6 tickets : ids = 1,2,3,4,5,6
+6 tickets : ids = 1,2,3,4,5,6
+1 tickets : ids = 1
+1 tickets : ids = 1
+1 tickets : ids = 1
+6 tickets : ids = 1,2,3,4,5,6
+
+PS> kubectl delete pod -l app=ticket
+PS> curl.exe -s http://cinema.local/api/tickets
+[]
+```
+Le nombre varie parce que les réservations sont stockées en mémoire, dans une liste propre à chaque instance (`tickets` dans `TicketController`). Il y a 2 pods ticket, chacun avec sa propre liste, et le Service répartit les requêtes entre eux : selon le pod qui répond, on voit 1 ou 6 réservations (on voit aussi que les ids se répètent, chaque pod a son propre compteur). Quand on supprime les pods ticket, les nouveaux pods repartent de zéro : toutes les réservations sont perdues (`[]`).
+La solution architecturale est de rendre ticket-service sans état : stocker les réservations dans une base de données externe partagée (par exemple PostgreSQL, avec un volume persistant PVC), à laquelle tous les pods se connectent. Les pods deviennent alors interchangeables et jetables, et les données survivent aux redémarrages et au scaling.
+
+**Q7.3**
+```
+PS> kubectl delete pod/movie-67fd5fbdfc-bmrxl
+PS> kubectl get pods -l app=movie
+NAME                     READY   STATUS    RESTARTS   AGE
+movie-67fd5fbdfc-szdbw   1/1     Running   0          37m
+movie-67fd5fbdfc-zrh44   0/1     Running   0          1s
+(quelques secondes plus tard)
+movie-67fd5fbdfc-szdbw   1/1     Running   0          37m
+movie-67fd5fbdfc-zrh44   1/1     Running   0          6s
+```
+Un nouveau pod (`movie-67fd5fbdfc-zrh44`, avec un nouveau nom et une nouvelle IP) est recréé immédiatement : le ReplicaSet du Deployment voit 1 pod au lieu des 2 demandés et corrige l'écart (boucle de réconciliation). Pendant ce temps, l'autre pod continue de répondre, donc pas de coupure. Avec un `kind: Pod` « nu », personne ne l'aurait recréé : le pod aurait disparu définitivement, et on aurait aussi perdu le scaling (`replicas`), le rolling update et le rollback.
