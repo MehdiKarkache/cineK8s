@@ -109,6 +109,64 @@ Dans Kubernetes, les pods ticket peuvent démarrer avant movie, mais ce n'est pa
 
 ## Partie 4
 
+### 4.0 Chargement des images dans Minikube
+Mon Minikube utilise le runtime containerd, donc l option A (`eval $(minikube docker-env)`) ne fonctionne pas. J'ai utilisé l'option C : réutiliser les images construites en Partie 3.
+```
+PS> minikube image load movie-service:1.0.0
+PS> minikube image load ticket-service:1.0.0
+PS> minikube image ls | Select-String "movie|ticket"
+docker.io/library/ticket-service:1.0.0
+docker.io/library/movie-service:1.0.0
+```
+
+### 4.4 Déploiement et vérifications
+```
+PS> kubectl apply -f k8s/
+namespace/cinema-exam created
+configmap/movie-config created
+configmap/ticket-config created
+deployment.apps/movie created
+service/movie created
+deployment.apps/ticket created
+service/ticket created
+
+PS> kubectl get pods
+NAME                      READY   STATUS    RESTARTS   AGE
+movie-59684459f4-2wcdh    1/1     Running   0          52s
+movie-59684459f4-9kgsz    1/1     Running   0          52s
+ticket-66d95c98b6-7zh2g   1/1     Running   0          52s
+ticket-66d95c98b6-nqfqg   1/1     Running   0          52s
+
+PS> kubectl get endpoints movie ticket
+NAME     ENDPOINTS                           AGE
+movie    10.244.0.13:8080,10.244.0.15:8080   52s
+ticket   10.244.0.14:8080,10.244.0.16:8080   52s
+
+PS> kubectl exec deploy/ticket -- wget -qO- http://movie:8080/api/movies/whoami
+{"hostname":"movie-59684459f4-9kgsz","environment":"kubernetes"}
+
+PS> kubectl exec deploy/ticket -- wget -qO- http://localhost:8080/actuator/health/readiness
+{"status":"UP","components":{"movie":{"status":"UP"},"readinessState":{"status":"UP"}}}
+
+PS> kubectl port-forward svc/ticket 8082:8080      (dans un autre terminal)
+PS> curl.exe -s -X POST localhost:8082/api/tickets -H "Content-Type: application/json" -d '{"movieId":2,"seats":2}'
+{"id":1,"movieId":2,"movieTitle":"Le Seigneur des Pods","seats":2,"total":24.00,"createdAt":"2026-10-08T10:53:52.294224878Z"}
+```
+Les 4 pods sont prêts, chaque Service a 2 endpoints, ticket joint movie par le nom du Service (`http://movie:8080`), `"environment":"kubernetes"` vient de la ConfigMap `movie-config`, et la réservation donne bien `24.00`.
+
+**Q4.1**
+`kubectl apply -f k8s/` traite les fichiers par ordre alphabétique. Les préfixes `00-`, `10-`, `20-`… garantissent l'ordre des dépendances : le namespace est créé avant les objets qui sont dedans (sinon erreur `namespaces "cinema-exam" not found`), et les ConfigMaps avant les Deployments qui les utilisent (sinon les pods seraient en `CreateContainerConfigError` au début).
+
+**Q4.2**
+C'est la startupProbe. Pendant le démarrage de Spring Boot (environ 30 s), `/actuator/health/liveness` ne répond pas encore, donc la startupProbe échoue et la readiness n'est pas encore lancée : le pod reste en 0/1. Ce n'est pas une anomalie, `RESTARTS` reste à 0 et les pods passent 1/1 dès que l'appli a démarré. On le voit dans les events :
+```
+PS> kubectl get events --field-selector reason=Unhealthy
+movie-59684459f4-2wcdh   Startup probe failed: Get "http://10.244.0.13:8080/actuator/health/liveness": dial tcp 10.244.0.13:8080: connect: connection refused
+```
+
+**Q4.3**
+Avec `imagePullPolicy: Always`, le kubelet essaierait à chaque démarrage de télécharger `movie-service:1.0.0` depuis Docker Hub (`docker.io/library/movie-service`). Or cette image n'existe que localement dans Minikube (chargée avec `minikube image load`), donc on aurait `ErrImagePull` puis `ImagePullBackOff`. `IfNotPresent` utilise l'image déjà présente sur le nœud.
+
 ## Partie 5
 
 ## Partie 6
